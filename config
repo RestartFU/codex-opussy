@@ -1,0 +1,26 @@
+# codex-opussy defaults. Don't edit this file for personal settings —
+# put overrides in ~/.config/codex-opussy/config (same KEY=VALUE format),
+# or set CODEX_OPUSSY_<KEY> env vars. Per-call flags on bin/codex-agent win over all.
+
+# Master switch. 0 = Claude uses its normal Claude subagents.
+ENABLED=1
+
+# Codex model and reasoning effort (low|medium|high|xhigh|max|ultra)
+MODEL=gpt-6.1-sol
+EFFORT=medium
+
+# read-only | workspace-write | danger-full-access
+SANDBOX=workspace-write
+# Network access inside workspace-write sandbox (1/0)
+NETWORK=1
+
+# Seconds before an agent is killed (0 = no limit)
+TIMEOUT=1800
+
+# Enforce via the PreToolUse hook on Agent (only matters if the hook is installed)
+HOOK=1
+# Agent subagent_types that keep running on Claude (comma-separated)
+HOOK_ALLOW=statusline-setup
+
+# Extra raw args passed to `codex exec` (space-separated)
+EXTRA_ARGS=

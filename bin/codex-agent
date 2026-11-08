@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# codex-agent — run one Codex subagent headlessly and print only its final report.
+#
+# Usage:
+#   codex-agent [options] "prompt"
+#   codex-agent [options] - < prompt.txt
+#
+# Options (override config for this call only):
+#   -m, --model MODEL        Codex model            (default: gpt-6.1-sol)
+#   -e, --effort LEVEL       reasoning effort       (low|medium|high|xhigh|max|ultra)
+#   -s, --sandbox MODE       read-only|workspace-write|danger-full-access
+#   -C, --cd DIR             working root for the agent (default: $PWD)
+#   -n, --name LABEL         label used in log/output file names
+#   -t, --timeout SECONDS    kill the agent after this long (0 = no limit)
+#       --network            allow network access inside workspace-write sandbox
+#       --no-network         deny network access inside workspace-write sandbox
+#       --add-dir DIR        extra writable dir (repeatable)
+#       --print-config       show the effective config and exit
+#   -h, --help
+#
+# Config precedence (later wins):
+#   built-in defaults < $SKILL_DIR/config < ~/.config/codex-opussy/config < CODEX_OPUSSY_* env < flags
+#
+# Output: the agent's final message on stdout, followed by a footer with the
+# log path. Exit code is codex's exit code (124 on timeout, 127 if codex is missing).
+set -uo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+# ---- defaults ---------------------------------------------------------------
+MODEL="gpt-6.1-sol"
+EFFORT="medium"
+SANDBOX="workspace-write"
+NETWORK="1"
+TIMEOUT="1800"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-opussy"
+EXTRA_ARGS=""
+
+# ---- config files (KEY=VALUE, '#' comments; not executed) -------------------
+load_config() {
+  local f="$1" key val
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ "$line" =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    val="${val%"${val##*[![:space:]]}"}"            # rtrim
+    val="${val%\"}"; val="${val#\"}"                 # strip optional quotes
+    case "$key" in
+      MODEL|EFFORT|SANDBOX|NETWORK|TIMEOUT|STATE_DIR|EXTRA_ARGS|ENABLED|HOOK|HOOK_ALLOW) printf -v "$key" '%s' "$val" ;;
+    esac
+  done < "$f"
+}
+load_config "$SKILL_DIR/config"
+load_config "${XDG_CONFIG_HOME:-$HOME/.config}/codex-opussy/config"
+
+# ---- env overrides ----------------------------------------------------------
+MODEL="${CODEX_OPUSSY_MODEL:-$MODEL}"
+EFFORT="${CODEX_OPUSSY_EFFORT:-$EFFORT}"
+SANDBOX="${CODEX_OPUSSY_SANDBOX:-$SANDBOX}"
+NETWORK="${CODEX_OPUSSY_NETWORK:-$NETWORK}"
+TIMEOUT="${CODEX_OPUSSY_TIMEOUT:-$TIMEOUT}"
+STATE_DIR="${CODEX_OPUSSY_STATE_DIR:-$STATE_DIR}"
+EXTRA_ARGS="${CODEX_OPUSSY_EXTRA_ARGS:-$EXTRA_ARGS}"
+
+# ---- flags ------------------------------------------------------------------
+WORKDIR="$PWD"
+NAME="agent"
+PROMPT=""
+ADD_DIRS=()
+PRINT_CONFIG=0
+
+usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model)   MODEL="$2"; shift 2 ;;
+    -e|--effort)  EFFORT="$2"; shift 2 ;;
+    -s|--sandbox) SANDBOX="$2"; shift 2 ;;
+    -C|--cd)      WORKDIR="$2"; shift 2 ;;
+    -n|--name)    NAME="$2"; shift 2 ;;
+    -t|--timeout) TIMEOUT="$2"; shift 2 ;;
+    --network)    NETWORK=1; shift ;;
+    --no-network) NETWORK=0; shift ;;
+    --add-dir)    ADD_DIRS+=("$2"); shift 2 ;;
+    --print-config) PRINT_CONFIG=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; PROMPT="$*"; break ;;
+    -)            PROMPT="$(cat)"; shift ;;
+    -*)           echo "codex-agent: unknown option $1" >&2; exit 2 ;;
+    *)            PROMPT="$*"; break ;;
+  esac
+done
+
+if [[ $PRINT_CONFIG -eq 1 ]]; then
+  printf 'MODEL=%s\nEFFORT=%s\nSANDBOX=%s\nNETWORK=%s\nTIMEOUT=%s\nSTATE_DIR=%s\nEXTRA_ARGS=%s\n' \
+    "$MODEL" "$EFFORT" "$SANDBOX" "$NETWORK" "$TIMEOUT" "$STATE_DIR" "$EXTRA_ARGS"
+  exit 0
+fi
+
+if [[ -z "$PROMPT" && ! -t 0 ]]; then PROMPT="$(cat)"; fi
+if [[ -z "$PROMPT" ]]; then echo "codex-agent: no prompt given" >&2; usage >&2; exit 2; fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex-agent: 'codex' CLI not found on PATH — fall back to a Claude subagent." >&2
+  exit 127
+fi
+
+# ---- run --------------------------------------------------------------------
+mkdir -p "$STATE_DIR/runs"
+SAFE_NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-40)"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$SAFE_NAME-$$"
+LOG="$STATE_DIR/runs/$RUN_ID.log"
+OUT="$STATE_DIR/runs/$RUN_ID.out.md"
+
+PREAMBLE="You are a subagent working for another AI agent (Claude), not a human. \
+Do the task below autonomously; do not ask questions — make reasonable assumptions and state them. \
+Your final message is the ONLY thing Claude will see, so make it a self-contained report: \
+what you did, what you found, concrete evidence (file paths with line numbers, commands run and their results), \
+and anything you were unsure about or could not verify. Never claim something works unless you actually checked it."
+
+ARGS=(exec --skip-git-repo-check --color never
+      -m "$MODEL"
+      -c "model_reasoning_effort=\"$EFFORT\""
+      -s "$SANDBOX"
+      -C "$WORKDIR"
+      -o "$OUT")
+if [[ "$SANDBOX" == "workspace-write" ]]; then
+  if [[ "$NETWORK" == "1" || "$NETWORK" == "true" ]]; then
+    ARGS+=(-c "sandbox_workspace_write.network_access=true")
+  else
+    ARGS+=(-c "sandbox_workspace_write.network_access=false")
+  fi
+fi
+for d in "${ADD_DIRS[@]+"${ADD_DIRS[@]}"}"; do ARGS+=(--add-dir "$d"); done
+# shellcheck disable=SC2206
+[[ -n "$EXTRA_ARGS" ]] && ARGS+=($EXTRA_ARGS)
+
+{
+  echo "# codex-opussy run $RUN_ID"
+  echo "# model=$MODEL effort=$EFFORT sandbox=$SANDBOX network=$NETWORK cwd=$WORKDIR"
+  echo
+} > "$LOG"
+
+START=$(date +%s)
+FULL_PROMPT="$PREAMBLE"$'\n\n'"--- TASK ---"$'\n'"$PROMPT"
+if [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] && command -v timeout >/dev/null 2>&1; then
+  printf '%s' "$FULL_PROMPT" | timeout --kill-after=10 "$TIMEOUT" codex "${ARGS[@]}" - >>"$LOG" 2>&1
+  RC=$?
+else
+  printf '%s' "$FULL_PROMPT" | codex "${ARGS[@]}" - >>"$LOG" 2>&1
+  RC=$?
+fi
+ELAPSED=$(( $(date +%s) - START ))
+
+if [[ -s "$OUT" ]]; then
+  cat "$OUT"
+else
+  echo "(codex produced no final message — last 40 log lines follow)"
+  tail -n 40 "$LOG"
+fi
+echo
+echo "---"
+STATUS="ok"; [[ $RC -eq 124 ]] && STATUS="TIMED OUT after ${TIMEOUT}s"; [[ $RC -ne 0 && $RC -ne 124 ]] && STATUS="FAILED (exit $RC)"
+echo "[codex-opussy] $STATUS · model=$MODEL effort=$EFFORT sandbox=$SANDBOX · ${ELAPSED}s · full log: $LOG"
+exit $RC
